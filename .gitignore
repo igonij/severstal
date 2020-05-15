@@ -1,0 +1,9 @@
+/train_images/*
+/test_images/*
+/severstal-steel-defect-detection.zip
+/models/*
+/submissions/*
+/train.csv
+/sample_submission.csv
+/.ipynb_checkpoints/*
+/__pycache__/
