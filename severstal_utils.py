@@ -16,20 +16,24 @@ import torchvision.transforms.functional as TF
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 
 from PIL import Image
 
 from matplotlib import pyplot as plt
 
-
+IMG_SIZE = (256, 1600)
 ## Transforms
 
 
 ## Dataset
+# Every image splitted to 7 overlaping 256x256 frames.
+# Overlap 32 px
+NUM_FRAMES = 7
+FRAME_SIZE = (256, 256)
+OVERLAP = (NUM_FRAMES * FRAME_SIZE[1] - IMG_SIZE[1]) // (NUM_FRAMES - 1)
 
-class SteelDataset(Dataset):
+class SteelFramesDataset(Dataset):
     """Severstal kaggle competition dataset
     """
     def __init__(self,
@@ -51,22 +55,149 @@ class SteelDataset(Dataset):
         self.imglist.sort()
 
     def __len__(self):
-        return len(self.imglist)
+        return NUM_FRAMES * len(self.imglist)
 
     def __getitem__(self, index):
-        fname = self.imglist[index]
-        img = Image.open(os.path.join(self.datadir, fname))
+        img_idx = index // NUM_FRAMES
+        frame_idx = index % NUM_FRAMES
+        left = frame_idx * (FRAME_SIZE[1] - OVERLAP)
+
+        fname = self.imglist[img_idx]
+        img = Image.open(os.path.join(self.datadir, fname)).convert(mode='L')
+        # For all input images with R == G == B. Checked
+
+        img = self.transform(img)
+        img = img[:, :, left:left+FRAME_SIZE[1]] # Crop frame
 
         if self.masks_df is not None:
+            target = np.zeros(IMG_SIZE, dtype=int)
             rle_df = self.masks_df[self.masks_df['ImageId'] == fname]
+            for _, row in rle_df.iterrows():
+                mask = rle_decode(row['EncodedPixels'])
+                target[mask] = row['ClassId']
 
-        if self.transform:
-            img = self.transform(img)
+            target = target[:, left:left+FRAME_SIZE[1]] # Crop frame
+            return img, target
 
         return img
 
 ## Trainer
 
+class Detector:
+    """Training and predictioning for Severstal Steel Defects Detection
+    """
+    def __init__(self, model, device=None):
+        if device:
+            self.device = device
+        else:
+            self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+        self.model = model.to(self.device)
+
+        self.best_model_wts = copy.deepcopy(self.model.state_dict())
+        self.best_score = 0.0
+
+        self.n_frames = []
+        self.loss_history = []
+        self.val_loss_history = []
+
+    def fit(self, dataloader, dataloader_val, loss_func,
+            epochs=1, print_every=1000, lr=0.001):
+        """Train model
+        """
+        optimizer = optim.Adam(self.model.parameters(), lr=lr)
+
+        self.n_frames = []
+        self.loss_history = []
+        self.val_loss_history = []
+
+        running_loss = 0
+        num_frames = 0
+        num_frames_prev = 0
+        for ee in range(epochs):
+            for x, target in dataloader:
+                self.model.train()
+                x = x.to(self.device)
+                target = target.to(self.device)
+
+                batch_size = x.shape[0]
+
+                scores = self.model(x)
+                loss = loss_func(scores, target)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                running_loss += batch_size*loss.item()
+                num_frames += batch_size
+
+                if print_every and num_frames % print_every < batch_size:
+                    self.n_frames.append(num_frames)
+                    self.loss_history.append(running_loss / (num_frames - num_frames_prev))
+
+                    running_loss = 0
+                    num_frames_prev = num_frames
+
+                    print(f'After {num_frames} frames processed')
+                    print(f'Trainig loss = {self.loss_history[-1]}')
+
+                    val_loss = self.validate(dataloader_val, loss_func)
+                    self.val_loss_history.append(val_loss)
+
+            self.n_frames.append(num_frames)
+            if num_frames - num_frames_prev:
+                self.loss_history.append(running_loss / (num_frames - num_frames_prev))
+            else:
+                self.loss_history.append(self.loss_history[-1])
+            running_loss = 0
+            num_frames_prev = num_images
+            print(f'After {ee+1} epochs:')
+            print(f'Training loss = {self.loss_history[-1]}')
+            val_loss = self.validate(dataloader_val, loss_func)
+            self.val_loss_history.append(val_loss)
+            print()
+        #     if dscore > self.best_model_dice:
+        #         self.best_model_dice = dscore
+        #         self.best_model_wts = copy.deepcopy(self.model.state_dict())
+        # print(f'Best model dice: {self.best_model_dice}')
+
+    def validate(self, dataloader, loss_func):
+        """Scores model with loss and Dice score for data from dataloader
+        """
+        self.model.eval()
+
+        n_processed = 0
+        loss = 0
+        with torch.no_grad():
+            for x, target in dataloader:
+                x = x.to(self.device)
+                target = target.to(self.device)
+
+                batch_size = x.shape[0]
+                scores = self.model(x)
+                loss += batch_size * loss_func(scores, target).item()
+
+                #pred = torch.argmax(scores, dim=1)
+
+                n_processed += batch_size
+
+            loss = loss / n_processed
+
+        print(f'Validation loss: {loss}')
+
+        return loss
+
+    def __call__(self, x):
+        """Evaluate model with input x and
+        return tensor with prediction
+        """
+        self.model.eval()
+        with torch.no_grad():
+            scores = self.model(x)
+            preds = torch.argmax(scores, dim=1)
+
+        return preds
 
 ## Misc functions
 
@@ -92,10 +223,41 @@ def rle_decode(rle, size=(256, 1600)):
     rle = rle.split(' ')
     rle = list(map(int, rle))
 
-    mask = np.zeros(np.prod(size))
+    mask = np.zeros(np.prod(size), dtype=bool)
     for start, length in zip(rle[::2], rle[1::2]):
-        mask[start:start + length] = 1
+        mask[start:start + length] = True
 
     mask = mask.reshape(size[1], size[0]).T # switched size because of rle Fortran order
 
     return mask
+
+def images_mean_std(datadir):
+    """Calculate mean and std for all images in datadir
+    """
+    num = 0
+    mean = 0
+    std = 0
+    for fname in os.listdir(datadir):
+        img = Image.open(os.path.join(datadir, fname)).convert('L')
+        img = np.array(img) / 255
+        mean += img.mean()
+        std += img.std()
+        num += 1
+    mean /= num
+    std /= num
+    return mean, std
+
+def dice(pred, target):
+    """Dice coef as scored in competition. Accepts predictions (0..4 class for
+    each pixel), not scores, so should not be used in loss function
+    """
+    pred = pred.flatten(start_dim=1)
+    target = target.flatten(start_dim=1)
+    # both_empty == 1 only if both pred and target are empty, 0 in other cases
+    both_empty = (1 - pred.max(dim=1)[0]) * \
+                    (1 - target.max(dim=1)[0])
+
+    D = (2 * torch.sum(pred == target, -1) + both_empty).float() / \
+        (torch.sum(pred > 0, -1) + torch.sum(target > 0, -1) + both_empty).float()
+
+    return D

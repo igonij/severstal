@@ -107,7 +107,7 @@ class UnetD(nn.Module):
             out_ch = out_ch // 2
 
         # output
-        self.outconv = nn.Conv2d(n_filters, 2, (1, 1), bias=True)
+        self.outconv = nn.Conv2d(n_filters, 5, (1, 1), bias=True)
 
     def forward(self, x):
         outs = []
