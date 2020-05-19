@@ -16,7 +16,6 @@ import torchvision.transforms.functional as TF
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
 
 from PIL import Image
 
@@ -35,6 +34,7 @@ OVERLAP = (NUM_FRAMES * FRAME_SIZE[1] - IMG_SIZE[1]) // (NUM_FRAMES - 1)
 
 class SteelFramesDataset(Dataset):
     """Severstal kaggle competition dataset
+    Croped frames output
     """
     def __init__(self,
                  datadir,
@@ -81,6 +81,49 @@ class SteelFramesDataset(Dataset):
 
         return img
 
+
+class ImagesDataset(Dataset):
+    """Severstal kaggle competition dataset
+    Entire image output
+    """
+    def __init__(self,
+                 datadir,
+                 imglist=None,
+                 masks_csv=None,
+                 transform=T.ToTensor()):
+        self.datadir = datadir
+        self.transform = transform
+
+        if masks_csv:
+            self.masks_df = pd.read_csv(masks_csv)
+        else:
+            self.masks_df = None
+
+        if imglist is None:
+            imglist = os.listdir(datadir)
+        self.imglist = imglist
+        self.imglist.sort()
+
+    def __len__(self):
+        return len(self.imglist)
+
+    def __getitem__(self, index):
+        fname = self.imglist[index]
+        img = Image.open(os.path.join(self.datadir, fname)).convert(mode='L')
+        # For all input images with R == G == B. Checked
+
+        img = self.transform(img)
+
+        if self.masks_df is not None:
+            target = np.zeros(IMG_SIZE, dtype=int)
+            rle_df = self.masks_df[self.masks_df['ImageId'] == fname]
+            for _, row in rle_df.iterrows():
+                mask = rle_decode(row['EncodedPixels'])
+                target[mask] = row['ClassId']
+            return img, target
+
+        return img
+
 ## Trainer
 
 class Detector:
@@ -96,10 +139,12 @@ class Detector:
 
         self.best_model_wts = copy.deepcopy(self.model.state_dict())
         self.best_score = 0.0
+        self.best_dice = 0.0
 
         self.n_frames = []
         self.loss_history = []
         self.val_loss_history = []
+        self.val_dice_history = []
 
     def fit(self, dataloader, dataloader_val, loss_func,
             epochs=1, print_every=1000, lr=0.001):
@@ -110,12 +155,13 @@ class Detector:
         self.n_frames = []
         self.loss_history = []
         self.val_loss_history = []
+        self.val_dice_history = []
 
         running_loss = 0
         num_frames = 0
         num_frames_prev = 0
         for ee in range(epochs):
-            for x, target in dataloader:
+            for x, target in tqdm(dataloader):
                 self.model.train()
                 x = x.to(self.device)
                 target = target.to(self.device)
@@ -129,7 +175,7 @@ class Detector:
                 loss.backward()
                 optimizer.step()
 
-                running_loss += batch_size*loss.item()
+                running_loss += batch_size * loss.item()
                 num_frames += batch_size
 
                 if print_every and num_frames % print_every < batch_size:
@@ -142,8 +188,9 @@ class Detector:
                     print(f'After {num_frames} frames processed')
                     print(f'Trainig loss = {self.loss_history[-1]}')
 
-                    val_loss = self.validate(dataloader_val, loss_func)
+                    val_loss, val_dice = self.validate(dataloader_val, loss_func)
                     self.val_loss_history.append(val_loss)
+                    self.val_dice_history.append(val_dice)
 
             self.n_frames.append(num_frames)
             if num_frames - num_frames_prev:
@@ -151,16 +198,17 @@ class Detector:
             else:
                 self.loss_history.append(self.loss_history[-1])
             running_loss = 0
-            num_frames_prev = num_images
+            num_frames_prev = num_frames
             print(f'After {ee+1} epochs:')
             print(f'Training loss = {self.loss_history[-1]}')
-            val_loss = self.validate(dataloader_val, loss_func)
+            val_loss, val_dice = self.validate(dataloader_val, loss_func)
             self.val_loss_history.append(val_loss)
+            self.val_dice_history.append(val_dice)
             print()
-        #     if dscore > self.best_model_dice:
-        #         self.best_model_dice = dscore
-        #         self.best_model_wts = copy.deepcopy(self.model.state_dict())
-        # print(f'Best model dice: {self.best_model_dice}')
+            if val_dice > self.best_dice:
+                self.best_dice = val_dice
+                self.best_model_wts = copy.deepcopy(self.model.state_dict())
+        print(f'Best model dice: {self.best_dice}')
 
     def validate(self, dataloader, loss_func):
         """Scores model with loss and Dice score for data from dataloader
@@ -169,6 +217,7 @@ class Detector:
 
         n_processed = 0
         loss = 0
+        dice = 0
         with torch.no_grad():
             for x, target in dataloader:
                 x = x.to(self.device)
@@ -178,15 +227,18 @@ class Detector:
                 scores = self.model(x)
                 loss += batch_size * loss_func(scores, target).item()
 
-                #pred = torch.argmax(scores, dim=1)
+                pred = torch.argmax(scores, dim=1)
+                dice += batch_size * dice4tensor(pred, target).mean().item()
 
                 n_processed += batch_size
 
             loss = loss / n_processed
+            dice = dice / n_processed
 
         print(f'Validation loss: {loss}')
+        print(f'Val Dice score:  {dice}')
 
-        return loss
+        return loss, dice
 
     def __call__(self, x):
         """Evaluate model with input x and
@@ -247,17 +299,27 @@ def images_mean_std(datadir):
     std /= num
     return mean, std
 
-def dice(pred, target):
-    """Dice coef as scored in competition. Accepts predictions (0..4 class for
-    each pixel), not scores, so should not be used in loss function
+def dice4tensor(pred, target):
+    """Dice coef as scored in competition. Accepts minibatch of predictions
+    (0..4 class for each pixel), not scores, so should not be used in loss
+    function
+    pred and target should be 4D tensors
+    Returns (N, 4) tensor of Dice scores for each image in minibatch
+    and 4 classes
     """
     pred = pred.flatten(start_dim=1)
     target = target.flatten(start_dim=1)
-    # both_empty == 1 only if both pred and target are empty, 0 in other cases
-    both_empty = (1 - pred.max(dim=1)[0]) * \
-                    (1 - target.max(dim=1)[0])
 
-    D = (2 * torch.sum(pred == target, -1) + both_empty).float() / \
-        (torch.sum(pred > 0, -1) + torch.sum(target > 0, -1) + both_empty).float()
+    dice = torch.zeros(target.shape[0], 4, device=pred.device)
+    for cls_id in range(1, 5):
+        pred_cls = (pred == cls_id).int()
+        trgt_cls = (target == cls_id).int()
+        # both_empty == 1 only if both pred and target are empty, 0 in other cases
+        both_empty = (1 - pred_cls.max(dim=1)[0]) * \
+                     (1 - trgt_cls.max(dim=1)[0])
 
-    return D
+        dice[:, cls_id-1] = \
+            (2 * torch.sum(pred_cls * trgt_cls, -1) + both_empty).float() / \
+            (torch.sum(pred_cls + trgt_cls, -1) + both_empty).float()
+
+    return dice
