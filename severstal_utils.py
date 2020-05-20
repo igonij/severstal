@@ -16,19 +16,104 @@ import torchvision.transforms.functional as TF
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from PIL import Image
 
 from matplotlib import pyplot as plt
 
-IMG_SIZE = (256, 1600)
-## Transforms
 
+## Transforms
+## Redifined transforms from torchvision to manage mask transforms correctly
+
+class Resize(T.Resize):
+    """Resize transform redefinition
+    """
+    def __init__(self, size, interpolation=Image.BILINEAR, resize_mask=True):
+        super().__init__(size, interpolation)
+        self.resize_mask = resize_mask
+
+    def __call__(self, imglist):
+        assert len(imglist) <= 2
+        imglist[0] = TF.resize(imglist[0], self.size, self.interpolation)
+        if (len(imglist) == 2) and self.resize_mask:
+            imglist[1] = TF.resize(imglist[1], self.size, Image.NEAREST)
+        return imglist
+
+class RandomCrop(T.RandomCrop):
+    """RandomCrop transform redefinition
+    """
+    def __call__(self, imglist):
+        """
+        Args:
+            img (PIL Image): Image to be cropped.
+
+        Returns:
+            PIL Image: Cropped image.
+        """
+        if self.padding is not None:
+            imglist = [TF.pad(img, self.padding, self.fill, self.padding_mode) for img in imglist]
+
+        # pad the width if needed
+        if self.pad_if_needed and imglist[0].size[0] < self.size[1]:
+            imglist = [TF.pad(img, (self.size[1] - img.size[0], 0), self.fill, self.padding_mode) for img in imglist]
+        # pad the height if needed
+        if self.pad_if_needed and imglist[0].size[1] < self.size[0]:
+            imglist = [TF.pad(img, (0, self.size[0] - img.size[1]), self.fill, self.padding_mode) for img in imglist]
+
+        i, j, h, w = self.get_params(imglist[0], self.size)
+
+        return [TF.crop(img, i, j, h, w) for img in imglist]
+
+class RandomHorizontalFlip(T.RandomHorizontalFlip):
+    """RandomHorizontalFlip tranform redefinition
+    """
+    def __call__(self, imglist):
+        assert len(imglist) <= 2
+        if random.random() < self.p:
+            return [TF.hflip(img) for img in imglist]
+        return imglist
+
+class RandomVerticalFlip(T.RandomVerticalFlip):
+    """RandomVerticalFlip transform redefinition
+    """
+    def __call__(self, imglist):
+        assert len(imglist) <= 2
+        if random.random() < self.p:
+            return [TF.vflip(img) for img in imglist]
+        return imglist
+
+class ToTensor:
+    """ToTensor transform redefinition
+    """
+    def __call__(self, imglist):
+        assert len(imglist) <= 2
+        return [TF.to_tensor(img) for img in imglist]
+
+class Normalize(T.Normalize):
+    """Normalize transform redefinition
+    """
+    def __call__(self, tensorlist):
+        assert len(tensorlist) <= 2
+        tensorlist[0] = TF.normalize(tensorlist[0], self.mean, self.std, self.inplace)
+        return tensorlist
+
+    def inverse(self, tensor):
+        """Applies inverse transformation on specified tensor
+            tensor: normalised tensor (C, H, W)
+        Returns denormalized tensor
+        """
+        std = 1 / np.asarray(self.std)
+        mean = - np.asarray(self.mean) * std
+        std = tuple(std)
+        mean = tuple(mean)
+        return TF.normalize(tensor, mean, std)
 
 ## Dataset
 # Every image splitted to 7 overlaping 256x256 frames.
 # Overlap 32 px
 NUM_FRAMES = 7
+IMG_SIZE = (256, 1600)
 FRAME_SIZE = (256, 256)
 OVERLAP = (NUM_FRAMES * FRAME_SIZE[1] - IMG_SIZE[1]) // (NUM_FRAMES - 1)
 
@@ -112,17 +197,19 @@ class ImagesDataset(Dataset):
         img = Image.open(os.path.join(self.datadir, fname)).convert(mode='L')
         # For all input images with R == G == B. Checked
 
-        img = self.transform(img)
-
         if self.masks_df is not None:
             target = np.zeros(IMG_SIZE, dtype=int)
             rle_df = self.masks_df[self.masks_df['ImageId'] == fname]
             for _, row in rle_df.iterrows():
                 mask = rle_decode(row['EncodedPixels'])
                 target[mask] = row['ClassId']
-            return img, target
+            img, target = self.transform([img, target])
+        else:
+            target = fname
+            img = self.transform([img])[0]
 
-        return img
+        return img, target
+
 
 ## Trainer
 
