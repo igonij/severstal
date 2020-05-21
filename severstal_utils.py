@@ -26,77 +26,56 @@ from matplotlib import pyplot as plt
 ## Transforms
 ## Redifined transforms from torchvision to manage mask transforms correctly
 
-class Resize(T.Resize):
-    """Resize transform redefinition
-    """
-    def __init__(self, size, interpolation=Image.BILINEAR, resize_mask=True):
-        super().__init__(size, interpolation)
-        self.resize_mask = resize_mask
-
-    def __call__(self, imglist):
-        assert len(imglist) <= 2
-        imglist[0] = TF.resize(imglist[0], self.size, self.interpolation)
-        if (len(imglist) == 2) and self.resize_mask:
-            imglist[1] = TF.resize(imglist[1], self.size, Image.NEAREST)
-        return imglist
-
 class RandomCrop(T.RandomCrop):
     """RandomCrop transform redefinition
     """
-    def __call__(self, imglist):
-        """
-        Args:
-            img (PIL Image): Image to be cropped.
-
-        Returns:
-            PIL Image: Cropped image.
-        """
-        if self.padding is not None:
-            imglist = [TF.pad(img, self.padding, self.fill, self.padding_mode) for img in imglist]
-
-        # pad the width if needed
-        if self.pad_if_needed and imglist[0].size[0] < self.size[1]:
-            imglist = [TF.pad(img, (self.size[1] - img.size[0], 0), self.fill, self.padding_mode) for img in imglist]
-        # pad the height if needed
-        if self.pad_if_needed and imglist[0].size[1] < self.size[0]:
-            imglist = [TF.pad(img, (0, self.size[0] - img.size[1]), self.fill, self.padding_mode) for img in imglist]
-
-        i, j, h, w = self.get_params(imglist[0], self.size)
-
-        return [TF.crop(img, i, j, h, w) for img in imglist]
+    def __call__(self, tpl):
+        img, trgt = tpl
+        i, j, h, w = self.get_params(img, self.size)
+        img = TF.crop(img, i, j, h, w)
+        if not isinstance(trgt, str):
+            trgt = trgt[i:i+h, j:j+w]
+        return (img, trgt)
 
 class RandomHorizontalFlip(T.RandomHorizontalFlip):
     """RandomHorizontalFlip tranform redefinition
     """
-    def __call__(self, imglist):
-        assert len(imglist) <= 2
+    def __call__(self, tpl):
+        img, trgt = tpl
         if random.random() < self.p:
-            return [TF.hflip(img) for img in imglist]
-        return imglist
+            img = TF.hflip(img)
+            if not isinstance(trgt, str):
+                trgt = np.flip(trgt, axis=1)
+        return (img, trgt)
 
 class RandomVerticalFlip(T.RandomVerticalFlip):
     """RandomVerticalFlip transform redefinition
     """
-    def __call__(self, imglist):
-        assert len(imglist) <= 2
+    def __call__(self, tpl):
+        img, trgt = tpl
         if random.random() < self.p:
-            return [TF.vflip(img) for img in imglist]
-        return imglist
+            img = TF.vflip(img)
+            if not isinstance(trgt, str):
+                trgt = np.flip(trgt, axis=0)
+        return (img, trgt)
 
 class ToTensor:
     """ToTensor transform redefinition
     """
-    def __call__(self, imglist):
-        assert len(imglist) <= 2
-        return [TF.to_tensor(img) for img in imglist]
+    def __call__(self, tpl):
+        img, trgt = tpl
+        img = TF.to_tensor(img)
+        if not isinstance(trgt, str):
+            trgt = torch.from_numpy(trgt.copy()) # copy() is "Negative stride" pytorch arror workaround
+        return (img, trgt)
 
 class Normalize(T.Normalize):
     """Normalize transform redefinition
     """
-    def __call__(self, tensorlist):
-        assert len(tensorlist) <= 2
-        tensorlist[0] = TF.normalize(tensorlist[0], self.mean, self.std, self.inplace)
-        return tensorlist
+    def __call__(self, tpl):
+        img, trgt = tpl
+        img = TF.normalize(img, self.mean, self.std, self.inplace)
+        return (img, trgt)
 
     def inverse(self, tensor):
         """Applies inverse transformation on specified tensor
@@ -155,7 +134,7 @@ class SteelFramesDataset(Dataset):
         img = img[:, :, left:left+FRAME_SIZE[1]] # Crop frame
 
         if self.masks_df is not None:
-            target = np.zeros(IMG_SIZE, dtype=int)
+            target = np.zeros(IMG_SIZE, dtype=int) # (H, W)
             rle_df = self.masks_df[self.masks_df['ImageId'] == fname]
             for _, row in rle_df.iterrows():
                 mask = rle_decode(row['EncodedPixels'])
@@ -198,15 +177,15 @@ class ImagesDataset(Dataset):
         # For all input images with R == G == B. Checked
 
         if self.masks_df is not None:
-            target = np.zeros(IMG_SIZE, dtype=int)
+            target = np.zeros(IMG_SIZE, dtype=int) # (H, W)
             rle_df = self.masks_df[self.masks_df['ImageId'] == fname]
             for _, row in rle_df.iterrows():
                 mask = rle_decode(row['EncodedPixels'])
                 target[mask] = row['ClassId']
-            img, target = self.transform([img, target])
         else:
             target = fname
-            img = self.transform([img])[0]
+
+        img, target = self.transform((img, target))
 
         return img, target
 
